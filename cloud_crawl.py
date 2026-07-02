@@ -48,7 +48,41 @@ def make_session(cookies_json: str | None = None) -> requests.Session:
 # ────────────────────────────────────────────────────────────
 
 def get_blog_recent_urls(sess: requests.Session, blog_id: str, pages: int = 2) -> list[str]:
+    """RSS 피드 우선 → 실패 시 JSON API 폴백 → HTML 폴백."""
     urls: list[str] = []
+
+    # 1) RSS 피드 (인증 불필요, JS 불필요)
+    try:
+        r = sess.get(f"https://rss.blog.naver.com/{blog_id}.xml", timeout=15)
+        if r.status_code == 200 and "<item>" in r.text:
+            for m in re.finditer(r"<link>\s*(https://blog\.naver\.com/[^<]+/(\d{5,}))\s*</link>", r.text):
+                u = m.group(1).strip()
+                if u not in urls:
+                    urls.append(u)
+            if urls:
+                return urls[:20]
+    except Exception as e:
+        print(f"  [블로그 RSS] {blog_id} 오류: {e}")
+
+    # 2) JSON API 폴백 (PostListByCategory)
+    try:
+        for page in range(1, pages + 1):
+            r = sess.get(
+                "https://blog.naver.com/PostListByCategory.naver",
+                params={"blogId": blog_id, "categoryNo": "0", "currentPage": page, "countPerPage": "20"},
+                timeout=15,
+            )
+            for m in re.finditer(r'"logNo"\s*:\s*"?(\d{5,})"?', r.text):
+                u = f"https://blog.naver.com/{blog_id}/{m.group(1)}"
+                if u not in urls:
+                    urls.append(u)
+            time.sleep(0.5)
+        if urls:
+            return urls
+    except Exception as e:
+        print(f"  [블로그 JSON] {blog_id} 오류: {e}")
+
+    # 3) 모바일 HTML 폴백
     for page in range(1, pages + 1):
         try:
             r = sess.get(
@@ -56,16 +90,13 @@ def get_blog_recent_urls(sess: requests.Session, blog_id: str, pages: int = 2) -
                 params={"blogId": blog_id, "categoryNo": "0", "page": page},
                 timeout=15,
             )
-            soup = BeautifulSoup(r.text, "lxml")
-            for a in soup.select("a[href*='blog.naver.com']"):
-                m = re.search(r"blog\.naver\.com/(\w+)/(\d{5,})", a.get("href", ""))
-                if m:
-                    u = f"https://blog.naver.com/{m.group(1)}/{m.group(2)}"
-                    if u not in urls:
-                        urls.append(u)
+            for m in re.finditer(r"blog\.naver\.com/(\w+)/(\d{5,})", r.text):
+                u = f"https://blog.naver.com/{m.group(1)}/{m.group(2)}"
+                if u not in urls:
+                    urls.append(u)
             time.sleep(0.8)
         except Exception as e:
-            print(f"  [블로그 URL] {blog_id} p{page} 오류: {e}")
+            print(f"  [블로그 HTML] {blog_id} p{page} 오류: {e}")
     return urls
 
 
@@ -124,31 +155,39 @@ def get_cafe_clubid(sess: requests.Session, cafe_id: str) -> str:
 
 
 def get_cafe_menu_ids(sess: requests.Session, clubid: str) -> list[str]:
-    """카페 게시판 메뉴 ID 목록 (JSON API)."""
-    try:
-        api = f"https://apis.naver.com/cafe-web/cafe-web-pc/v1.0/apps/cafes/{clubid}/menus"
-        r = sess.get(api, timeout=15)
-        data = r.json()
-        menus = data.get("message", {}).get("result", {}).get("menus", [])
-        return [str(m["menuId"]) for m in menus if m.get("menuType") in ("B", "P", "N")]
-    except Exception:
-        pass
+    """카페 게시판 메뉴 ID 목록 — 여러 엔드포인트 순차 시도."""
+    apis = [
+        f"https://apis.naver.com/cafe-web/cafe2/CafeMemberMenuList.json?cafeId={clubid}",
+        f"https://cafe.naver.com/CafeMemberList.nhn?clubid={clubid}&search.boardtype=L",
+        f"https://apis.naver.com/cafe-web/cafe-web-pc/v1.0/apps/cafes/{clubid}/menus",
+    ]
+    for api in apis:
+        try:
+            r = sess.get(api, timeout=15)
+            if r.status_code != 200:
+                continue
+            text = r.text
+            # JSON 응답: menuId 또는 menuid 키 추출
+            ids = re.findall(r'"(?:menuId|menuid)"\s*:\s*(\d+)', text)
+            if ids:
+                return list(dict.fromkeys(ids))[:12]
+        except Exception:
+            pass
 
-    # 폴백: 카페 구형 HTML 파싱
+    # HTML 폴백: 카페 메인 페이지 파싱
     try:
-        r = sess.get(
-            f"https://cafe.naver.com/CafeList.nhn?clubid={clubid}", timeout=15
-        )
-        soup = BeautifulSoup(r.text, "lxml")
+        r = sess.get(f"https://cafe.naver.com/{clubid}", timeout=15)
         ids = []
-        for a in soup.select("a[href*='menuid=']"):
-            mm = re.search(r"menuid=(\d+)", a.get("href", ""))
-            if mm and mm.group(1) not in ids:
-                ids.append(mm.group(1))
-        return ids[:10]
+        for m in re.finditer(r"menuid=(\d+)|menuId[\"']?\s*:\s*(\d+)", r.text):
+            mid = m.group(1) or m.group(2)
+            if mid and mid not in ids:
+                ids.append(mid)
+        if ids:
+            return ids[:12]
     except Exception as e:
-        print(f"  [카페 메뉴] clubid={clubid} 오류: {e}")
-        return []
+        print(f"  [카페 메뉴 HTML] clubid={clubid} 오류: {e}")
+
+    return []
 
 
 def get_cafe_article_ids(

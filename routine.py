@@ -345,7 +345,7 @@ def main():
         except Exception as e:
             print(f"  비판검토 Drive 저장 오류: {e}")
     else:
-        print("\nDrive 저장 건너뜀 (GDRIVE_SERVICE_ACCOUNT_JSON 또는 GDRIVE_FOLDER_ID 미설정)")
+        print("\nDrive 저장 건너뜀 (GDRIVE_REFRESH_TOKEN 또는 GDRIVE_FOLDER_ID 미설정)")
 
     # ── 이메일 발송 ────────────────────────────────────────────
     print("\n이메일 발송 중...")
