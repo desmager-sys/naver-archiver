@@ -55,12 +55,21 @@ def get_blog_recent_urls(sess: requests.Session, blog_id: str, pages: int = 2) -
     try:
         r = sess.get(f"https://rss.blog.naver.com/{blog_id}.xml", timeout=15)
         if r.status_code == 200 and "<item>" in r.text:
-            for m in re.finditer(r"<link>\s*(https://blog\.naver\.com/[^<]+/(\d{5,}))\s*</link>", r.text):
+            # <guid> 태그: 쿼리스트링 없는 깔끔한 URL
+            seen_ids: set[str] = set()
+            for m in re.finditer(r"<guid[^>]*>\s*(https://blog\.naver\.com/\w+/(\d{5,}))\s*</guid>", r.text):
                 u = m.group(1).strip()
-                if u not in urls:
+                if u not in seen_ids:
+                    seen_ids.add(u)
                     urls.append(u)
+            # 폴백: URL 패턴 직접 추출 (CDATA 무시)
+            if not urls:
+                for m in re.finditer(rf"https://blog\.naver\.com/{blog_id}/(\d{{5,}})", r.text):
+                    u = f"https://blog.naver.com/{blog_id}/{m.group(1)}"
+                    if u not in urls:
+                        urls.append(u)
             if urls:
-                return urls[:20]
+                return list(dict.fromkeys(urls))[:20]
     except Exception as e:
         print(f"  [블로그 RSS] {blog_id} 오류: {e}")
 
