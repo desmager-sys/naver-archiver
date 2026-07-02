@@ -31,6 +31,8 @@ from analyze import _keys, _call, analyze_post, _daily_count  # Gemini 로직 �
 # ────────────────────────────────────────────────────────────
 _BATCH_SIZE      = 4     # 한 번에 묶을 최대 글 수
 _BATCH_CHAR_MAX  = 4000  # 배치 내 총 글자 수 상한 (토큰 절약)
+_MAX_PER_SOURCE  = 5     # 소스당 최대 처리 글 수 (첫 실행 폭탄 방지)
+_MAX_TOTAL       = 15    # 런당 전체 처리 글 수 상한
 
 
 def _summarize_batch(batch: list[dict], keys: list[str]) -> list[str | None]:
@@ -247,7 +249,7 @@ def main():
             urls = get_blog_recent_urls(sess, blog["id"], pages=2)
             fresh = [u for u in urls if u not in seen]
             print(f"  총 {len(urls)}개 | 새글 {len(fresh)}개")
-            for url in fresh[:10]:
+            for url in fresh[:_MAX_PER_SOURCE]:
                 post = fetch_blog_post(sess, url)
                 if not post.get("body"):
                     seen.add(url)
@@ -271,10 +273,10 @@ def main():
             menu_ids = get_cafe_menu_ids(sess, clubid)
             print(f"  메뉴 {len(menu_ids)}개")
 
-            for menu_id in menu_ids[:6]:
+            for menu_id in menu_ids[:4]:
                 try:
                     art_ids = get_cafe_article_ids(sess, clubid, menu_id, pages=1)
-                    for aid in art_ids[:8]:
+                    for aid in art_ids[:_MAX_PER_SOURCE]:
                         url = f"https://cafe.naver.com/{cafe['id']}/{aid}"
                         if url in seen:
                             continue
@@ -291,6 +293,11 @@ def main():
                     print(f"  menu {menu_id} 오류: {e}")
         except Exception as e:
             print(f"  오류: {e}")
+
+    # 전체 상한 적용
+    if len(new_posts) > _MAX_TOTAL:
+        print(f"  ⚠ 총 {len(new_posts)}개 중 {_MAX_TOTAL}개만 처리 (상한 적용)")
+        new_posts = new_posts[:_MAX_TOTAL]
 
     print(f"\n새 글 합계: {len(new_posts)}개")
     save_seen(seen)

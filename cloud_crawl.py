@@ -69,7 +69,7 @@ def get_blog_recent_urls(sess: requests.Session, blog_id: str, pages: int = 2) -
                     if u not in urls:
                         urls.append(u)
             if urls:
-                return list(dict.fromkeys(urls))[:20]
+                return list(dict.fromkeys(urls))[:10]
     except Exception as e:
         print(f"  [블로그 RSS] {blog_id} 오류: {e}")
 
