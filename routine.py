@@ -23,7 +23,88 @@ from cloud_drive import (
     save_text_to_drive, safe_filename,
 )
 from cloud_email import send_email
-from analyze import _keys, _call, analyze_post   # Gemini 로직 재사용
+from analyze import _keys, _call, analyze_post, _daily_count  # Gemini 로직 재사용
+
+
+# ────────────────────────────────────────────────────────────
+# Gemini 배치 요약 — API 요청 수 최소화
+# ────────────────────────────────────────────────────────────
+_BATCH_SIZE      = 4     # 한 번에 묶을 최대 글 수
+_BATCH_CHAR_MAX  = 4000  # 배치 내 총 글자 수 상한 (토큰 절약)
+
+
+def _summarize_batch(batch: list[dict], keys: list[str]) -> list[str | None]:
+    """2~4개 글을 1회 Gemini 호출로 처리. 요청 횟수를 1/N로 절감."""
+    if len(batch) == 1:
+        return [analyze_post(batch[0]["body"][:5000], keys)]
+
+    items = []
+    for i, p in enumerate(batch, 1):
+        items.append(
+            f"=== 글{i}: [{p['author']}] {p['title'][:40]} ===\n"
+            f"{p['body'][:1200]}"
+        )
+
+    prompt = (
+        f"아래 {len(batch)}개의 투자/경제 글을 각각 간결하게 분석하세요.\n\n"
+        + "\n\n".join(items)
+        + f"\n\n각 글에 대해 정확히 아래 형식으로 답하세요 (총 {len(batch)}개):\n"
+        + "".join(
+            f"\n**[글{i}]**\n- 핵심 주장: (1줄)\n- 근거: (1줄)\n- 사고 패턴: (1줄)\n"
+            for i in range(1, len(batch) + 1)
+        )
+    )
+
+    raw = _call(prompt, keys, max_tokens=350 * len(batch))
+    if not raw:
+        # 배치 실패 → 개별 처리로 폴백
+        return [analyze_post(p["body"][:5000], keys) for p in batch]
+
+    # [글N] 마커 기준으로 결과 분리
+    results: list[str | None] = [None] * len(batch)
+    for i in range(len(batch)):
+        marker = f"**[글{i+1}]**"
+        nxt    = f"**[글{i+2}]**"
+        if marker in raw:
+            start = raw.index(marker) + len(marker)
+            end   = raw.index(nxt) if nxt in raw else len(raw)
+            results[i] = raw[start:end].strip()
+    return results
+
+
+def summarize_all(posts: list[dict], keys: list[str]) -> list[str | None]:
+    """
+    전체 포스트를 효율적으로 Gemini 요약.
+    - 짧은 글(≤1500자): 최대 4개씩 배치 처리 → 요청 횟수 최소화
+    - 긴 글(>1500자):   개별 처리 (배치 시 토큰 초과 위험)
+    """
+    results: list[str | None] = [None] * len(posts)
+    batch_idx:   list[int] = []
+    batch_chars: int       = 0
+
+    def flush():
+        nonlocal batch_chars
+        if not batch_idx:
+            return
+        summaries = _summarize_batch([posts[i] for i in batch_idx], keys)
+        for idx, s in zip(batch_idx, summaries):
+            results[idx] = s
+        batch_idx.clear()
+        batch_chars = 0  # noqa: F841  (reassigned in outer scope)
+
+    for i, post in enumerate(posts):
+        body_len = len(post.get("body", ""))
+        if body_len > 1500:
+            flush()
+            results[i] = analyze_post(post["body"][:5000], keys)
+        else:
+            if batch_chars + body_len > _BATCH_CHAR_MAX or len(batch_idx) >= _BATCH_SIZE:
+                flush()
+            batch_idx.append(i)
+            batch_chars += body_len
+
+    flush()
+    return results
 
 KST       = timezone(timedelta(hours=9))
 SEEN_FILE = Path(__file__).parent / "seen.json"
@@ -224,14 +305,16 @@ def main():
         print("새 글 없음 → 확인 이메일 발송 완료")
         return
 
-    # ── Gemini 요약 ────────────────────────────────────────────
-    print("Gemini 요약 중...")
-    for i, post in enumerate(new_posts, 1):
-        label = f"{post['author']} - {post['title'][:35]}"
-        print(f"  [{i}/{len(new_posts)}] {label}...", end="", flush=True)
-        summary = analyze_post(post["body"][:5000], gemini_keys)
-        post["summary"] = summary or "(요약 실패)"
-        print(" ✓")
+    # ── Gemini 배치 요약 (API 요청 최소화) ────────────────────
+    n = len(new_posts)
+    est_calls = max(1, -(-n // _BATCH_SIZE))   # ceil division
+    print(f"Gemini 요약 중... ({n}건 → 배치 처리, 예상 {est_calls}회 API 호출)")
+    summaries = summarize_all(new_posts, gemini_keys)
+    for post, s in zip(new_posts, summaries):
+        post["summary"] = s or "(요약 실패)"
+
+    used = sum(_daily_count.values())
+    print(f"  완료 — 오늘 Gemini 총 호출: {used}회")
 
     # ── Claude 비판 검토 ───────────────────────────────────────
     print("\nClaude 비판 검토 중...")
