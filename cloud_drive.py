@@ -6,22 +6,30 @@ import io, os, json, re
 
 
 def get_drive_service():
-    sa_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
-    if not sa_json:
-        return None
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
+    # OAuth 방식 (개인 Drive용 — 파일 소유권이 사용자에게 귀속)
+    refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN", "")
+    client_id     = os.environ.get("GDRIVE_CLIENT_ID", "")
+    client_secret = os.environ.get("GDRIVE_CLIENT_SECRET", "")
 
-        sa_info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(
-            sa_info,
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-        )
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        print(f"  [Drive] 서비스 초기화 실패: {e}")
-        return None
+    if refresh_token and client_id and client_secret:
+        try:
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+
+            creds = Credentials(
+                token=None,
+                refresh_token=refresh_token,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_uri="https://oauth2.googleapis.com/token",
+            )
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            print(f"  [Drive] OAuth 초기화 실패: {e}")
+            return None
+
+    print("  [Drive] GDRIVE_REFRESH_TOKEN 없음 → 건너뜀")
+    return None
 
 
 def get_or_create_folder(service, parent_id: str, name: str) -> str:

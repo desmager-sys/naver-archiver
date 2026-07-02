@@ -26,11 +26,12 @@ _daily_count: dict[str, int]   = {}
 def _keys():
     out = []
     k = os.environ.get("GEMINI_API_KEY", "").strip()
-    if k: out.append(k)
+    if k and k.startswith("AIzaSy"): out.append(k)
     for i in range(2, 10):
         k = os.environ.get(f"GEMINI_API_KEY_{i}", "").strip()
         if not k: break
-        out.append(k)
+        if k.startswith("AIzaSy"):  # "AQ." 등 비정상 키 자동 제외
+            out.append(k)
     return out
 
 
@@ -71,7 +72,7 @@ def _call(prompt, keys, max_tokens=2000):
             resp = genai.GenerativeModel(model).generate_content(
                 prompt,
                 generation_config={"max_output_tokens": max_tokens, "temperature": 0.3},
-                request_options={"timeout": 120},
+                request_options={"timeout": 15},  # 120→15: 무효 키 gRPC 행업 방지
             )
             text = getattr(resp, "text", "") or ""
             if text.strip():
