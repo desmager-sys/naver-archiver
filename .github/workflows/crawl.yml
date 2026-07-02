@@ -1,0 +1,53 @@
+name: Naver Archiver — 자동 크롤링·분석·발송
+
+# KST 07:00 / 12:00 / 17:00 실행 (= UTC 22:00 / 03:00 / 08:00)
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 07:00 KST
+    - cron: '0 3  * * *'   # 12:00 KST
+    - cron: '0 8  * * *'   # 17:00 KST
+  workflow_dispatch:         # 수동 실행 버튼
+
+permissions:
+  contents: write            # seen.json 커밋을 위한 쓰기 권한
+
+jobs:
+  crawl-analyze-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements_cloud.txt
+
+      - name: Run routine
+        run: python routine.py
+        env:
+          GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2:             ${{ secrets.GEMINI_API_KEY_2 }}
+          ANTHROPIC_API_KEY:            ${{ secrets.ANTHROPIC_API_KEY }}
+          NAVER_COOKIES_JSON:           ${{ secrets.NAVER_COOKIES_JSON }}
+          GMAIL_FROM:                   desmager@gmail.com
+          GMAIL_TO:                     desmager@gmail.com
+          GMAIL_APP_PASSWORD:           ${{ secrets.GMAIL_APP_PASSWORD }}
+          GDRIVE_FOLDER_ID:             ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Commit seen.json
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add seen.json
+          git diff --cached --quiet || git commit -m "chore: update seen URLs [skip ci]"
+          git push 2>/dev/null || true
