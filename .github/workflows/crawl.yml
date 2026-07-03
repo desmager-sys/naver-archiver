@@ -1,8 +1,11 @@
 name: Naver Archiver — 자동 크롤링·분석·발송
 
-# KST 07:00 / 12:00 / 17:00 실행 (= UTC 22:00 / 03:00 / 08:00)
+# KST 01:00 / 07:00 / 12:00 / 17:00 실행 (= UTC 16:00 / 22:00 / 03:00 / 08:00)
+# 01:00 회차는 과거글 백필 전용 — 그날 남은 Gemini 쿼터를 소진할 때까지 캡 없이
+# 크롤링하고, 이메일은 보내지 않는다(Drive에만 조용히 쌓임).
 on:
   schedule:
+    - cron: '0 16 * * *'   # 01:00 KST (백필 전용, 이메일 없음)
     - cron: '0 22 * * *'   # 07:00 KST
     - cron: '0 3  * * *'   # 12:00 KST
     - cron: '0 8  * * *'   # 17:00 KST
@@ -14,7 +17,7 @@ permissions:
 jobs:
   crawl-analyze-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 180     # 01:00 백필 회차는 쿼터 소진까지 오래 걸릴 수 있음
 
     steps:
       - name: Checkout repo
@@ -35,6 +38,7 @@ jobs:
       - name: Run routine
         run: python routine.py
         env:
+          ARCHIVER_BACKFILL:            ${{ (github.event_name == 'schedule' && github.event.schedule == '0 16 * * *') && '1' || '0' }}
           GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEY_2:             ${{ secrets.GEMINI_API_KEY_2 }}
           ANTHROPIC_API_KEY:            ${{ secrets.ANTHROPIC_API_KEY }}
@@ -47,10 +51,11 @@ jobs:
           GDRIVE_CLIENT_ID:             ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET:         ${{ secrets.GDRIVE_CLIENT_SECRET }}
 
-      - name: Commit seen.json
+      - name: Commit state files
         run: |
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
           git add seen.json
-          git diff --cached --quiet || git commit -m "chore: update seen URLs [skip ci]"
+          if [ -f last_email_at.json ]; then git add last_email_at.json; fi
+          git diff --cached --quiet || git commit -m "chore: update seen URLs / last email timestamp [skip ci]"
           git push 2>/dev/null || true

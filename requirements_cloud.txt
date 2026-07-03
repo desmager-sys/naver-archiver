@@ -6,3 +6,5 @@ google-generativeai>=0.5.0
 google-api-python-client>=2.130.0
 google-auth>=2.29.0
 anthropic>=0.28.0
+selenium>=4.20.0
+webdriver-manager>=4.0.0

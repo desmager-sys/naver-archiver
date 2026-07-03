@@ -17,6 +17,7 @@ from cloud_crawl import (
     get_blog_recent_urls, fetch_blog_post,
     get_cafe_clubid, get_cafe_menu_ids,
     get_cafe_article_ids, fetch_cafe_post,
+    close_selenium_driver,
 )
 from cloud_drive import (
     get_drive_service, get_or_create_folder,
@@ -108,9 +109,14 @@ def summarize_all(posts: list[dict], keys: list[str]) -> list[str | None]:
     flush()
     return results
 
-KST       = timezone(timedelta(hours=9))
-SEEN_FILE = Path(__file__).parent / "seen.json"
-GDRIVE_ROOT = os.environ.get("GDRIVE_FOLDER_ID", "")
+KST            = timezone(timedelta(hours=9))
+SEEN_FILE      = Path(__file__).parent / "seen.json"
+LAST_EMAIL_FILE = Path(__file__).parent / "last_email_at.json"
+GDRIVE_ROOT    = os.environ.get("GDRIVE_FOLDER_ID", "")
+
+# 새벽 백필 전용 회차(ARCHIVER_BACKFILL=1) — 그날 남은 Gemini 쿼터를 소진할 때까지
+# 과거 글을 최대한 크롤링하되, 이메일은 보내지 않는다(조용히 Drive에만 쌓인다).
+BACKFILL = os.environ.get("ARCHIVER_BACKFILL", "0") == "1"
 
 
 # ────────────────────────────────────────────────────────────
@@ -126,6 +132,27 @@ def load_seen() -> set[str]:
 def save_seen(seen: set[str]):
     SEEN_FILE.write_text(
         json.dumps(sorted(seen), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+# ────────────────────────────────────────────────────────────
+# last_email_at.json — 직전에 실제로 이메일을 보낸 시각(이후 생성된 글만
+# 다음 이메일에 포함하기 위한 기준점)
+# ────────────────────────────────────────────────────────────
+
+def load_last_email_at() -> datetime:
+    if LAST_EMAIL_FILE.exists():
+        try:
+            return datetime.fromisoformat(json.loads(LAST_EMAIL_FILE.read_text(encoding="utf-8"))["at"])
+        except Exception:
+            pass
+    return datetime.fromtimestamp(0, KST)
+
+
+def save_last_email_at(dt: datetime):
+    LAST_EMAIL_FILE.write_text(
+        json.dumps({"at": dt.isoformat()}, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -167,7 +194,7 @@ def claude_critique(posts: list[dict]) -> str:
 
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5-20251022",
+            model="claude-sonnet-5",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -232,10 +259,24 @@ def main():
     now = datetime.now(KST)
     print(f"\n{'=' * 60}")
     print(f"네이버 아카이버 실행: {now.strftime('%Y-%m-%d %H:%M KST')}")
+    if BACKFILL:
+        print("모드: 새벽 백필 전용 (캡 해제, 이메일 미발송)")
     print(f"{'=' * 60}\n")
+
+    # 백필 회차는 캡을 사실상 해제하고, RSS 50개 캡 밖의 과거 글을 적극적으로 찾는다.
+    # 평상시 회차는 RSS 최근 50개 안에서만 신규글을 판단(= 오탐 없는 "진짜 새 글"만).
+    max_per_source = 10**9 if BACKFILL else _MAX_PER_SOURCE
+    max_total       = 10**9 if BACKFILL else _MAX_TOTAL
+    blog_want       = 10**9 if BACKFILL else 0
+    blog_max_pages  = 400   if BACKFILL else 5
 
     gemini_keys = _keys()
     cookies_json = os.environ.get("NAVER_COOKIES_JSON", "")
+    if not cookies_json:
+        # 로컬 실행: GitHub Secrets가 아니라 setup_login.py가 만든 쿠키 파일을 직접 사용
+        local_cookie_file = Path(__file__).parent / "naver_cookies.json"
+        if local_cookie_file.exists():
+            cookies_json = local_cookie_file.read_text(encoding="utf-8")
     sess = make_session(cookies_json or None)
     seen = load_seen()
     print(f"seen URLs: {len(seen)}개\n")
@@ -246,14 +287,20 @@ def main():
     for blog in BLOGS:
         print(f"[블로그] {blog['name']} ...")
         try:
-            urls = get_blog_recent_urls(sess, blog["id"], pages=2)
+            urls, date_map = get_blog_recent_urls(
+                sess, blog["id"], pages=2, seen=seen, want=blog_want, max_pages=blog_max_pages
+            )
             fresh = [u for u in urls if u not in seen]
             print(f"  총 {len(urls)}개 | 새글 {len(fresh)}개")
-            for url in fresh[:_MAX_PER_SOURCE]:
+            for url in fresh[:max_per_source]:
                 post = fetch_blog_post(sess, url)
                 if not post.get("body"):
                     seen.add(url)
                     continue
+                real_dt = date_map.get(url)
+                if real_dt:
+                    post["date"] = real_dt.strftime("%Y-%m-%d")
+                post["published_dt"] = real_dt  # None이면 백필(과거글) — 이메일 대상에서 자동 제외
                 post.update({"author": blog["name"], "source": "blog",
                              "blog_id": blog["id"]})
                 new_posts.append(post)
@@ -270,13 +317,13 @@ def main():
                 print(f"  clubid 조회 실패, 건너뜀"); continue
             print(f"  clubid: {clubid}")
 
-            menu_ids = get_cafe_menu_ids(sess, clubid)
+            menu_ids = get_cafe_menu_ids(sess, clubid, cafe["id"])
             print(f"  메뉴 {len(menu_ids)}개")
 
             for menu_id in menu_ids[:4]:
                 try:
                     art_ids = get_cafe_article_ids(sess, clubid, menu_id, pages=1)
-                    for aid in art_ids[:_MAX_PER_SOURCE]:
+                    for aid in art_ids[:max_per_source]:
                         url = f"https://cafe.naver.com/{cafe['id']}/{aid}"
                         if url in seen:
                             continue
@@ -284,6 +331,9 @@ def main():
                         if not post.get("body"):
                             seen.add(url)
                             continue
+                        # 게시판 목록은 항상 최신순이라, 여기 도달한 글은 seen 기준
+                        # 실제로 "처음 발견된" 글 — 정확한 발행시각을 못 얻었으면 크롤 시각으로 대체.
+                        post["published_dt"] = post.get("published_dt") or now
                         post.update({"author": cafe["name"], "source": "cafe",
                                      "url": url,
                                      "date": post.get("date") or now.strftime("%Y-%m-%d")})
@@ -294,10 +344,12 @@ def main():
         except Exception as e:
             print(f"  오류: {e}")
 
-    # 전체 상한 적용
-    if len(new_posts) > _MAX_TOTAL:
-        print(f"  ⚠ 총 {len(new_posts)}개 중 {_MAX_TOTAL}개만 처리 (상한 적용)")
-        new_posts = new_posts[:_MAX_TOTAL]
+    close_selenium_driver()
+
+    # 전체 상한 적용 (백필 회차는 사실상 무제한 — Gemini 쿼터 소진이 자연스러운 한도가 된다)
+    if len(new_posts) > max_total:
+        print(f"  ⚠ 총 {len(new_posts)}개 중 {max_total}개만 처리 (상한 적용)")
+        new_posts = new_posts[:max_total]
 
     print(f"\n새 글 합계: {len(new_posts)}개")
     save_seen(seen)
@@ -305,6 +357,9 @@ def main():
 
     # ── 새 글 없음 ─────────────────────────────────────────────
     if not new_posts:
+        if BACKFILL:
+            print("백필 대상 없음 (모든 소스가 이미 최신 상태) → 이메일 없이 종료")
+            return
         send_email(
             subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 없음 ✓",
             body=f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n새로 올라온 글이 없습니다.",
@@ -323,12 +378,19 @@ def main():
     used = sum(_daily_count.values())
     print(f"  완료 — 오늘 Gemini 총 호출: {used}회")
 
-    # ── Claude 비판 검토 ───────────────────────────────────────
-    print("\nClaude 비판 검토 중...")
-    critique = claude_critique(new_posts)
-    print("  완료")
+    # ── 이메일 대상 선별: 직전 이메일 발송 시각 이후 "생성된" 글만 ──────
+    # (백필로 찾은 과거 글은 published_dt가 None이라 여기서 자동 제외된다)
+    last_email_at = load_last_email_at()
+    email_posts = [p for p in new_posts if p.get("published_dt") and p["published_dt"] > last_email_at]
 
-    # ── Google Drive 저장 ──────────────────────────────────────
+    # ── Claude 비판 검토 (백필 회차는 생략 — 이메일에 안 쓰이므로 불필요한 호출) ──
+    critique = ""
+    if not BACKFILL:
+        print("\nClaude 비판 검토 중...")
+        critique = claude_critique(email_posts or new_posts)
+        print("  완료")
+
+    # ── Google Drive 저장 (백필 포함 전체를 저장 — 아카이브는 항상 완전하게) ──
     drive = get_drive_service()
     if drive and GDRIVE_ROOT:
         print("\nDrive 저장 중...")
@@ -342,24 +404,40 @@ def main():
             except Exception as e:
                 print(f"  Drive 저장 오류: {e}")
 
-        # 비판검토 결과 저장
-        try:
-            crit_fid = get_or_create_folder(drive, GDRIVE_ROOT, "비판검토")
-            crit_fname = f"{now.strftime('%Y%m%d_%H%M')}_critique.md"
-            crit_content = f"# 비판 검토 — {now.strftime('%Y-%m-%d %H:%M KST')}\n\n{critique}"
-            save_text_to_drive(drive, crit_content, crit_fid, crit_fname)
-            print(f"  ✓ 비판검토/{crit_fname}")
-        except Exception as e:
-            print(f"  비판검토 Drive 저장 오류: {e}")
+        # 비판검토 결과 저장 (백필 회차는 critique를 만들지 않으므로 생략)
+        if critique:
+            try:
+                crit_fid = get_or_create_folder(drive, GDRIVE_ROOT, "비판검토")
+                crit_fname = f"{now.strftime('%Y%m%d_%H%M')}_critique.md"
+                crit_content = f"# 비판 검토 — {now.strftime('%Y-%m-%d %H:%M KST')}\n\n{critique}"
+                save_text_to_drive(drive, crit_content, crit_fid, crit_fname)
+                print(f"  ✓ 비판검토/{crit_fname}")
+            except Exception as e:
+                print(f"  비판검토 Drive 저장 오류: {e}")
     else:
         print("\nDrive 저장 건너뜀 (GDRIVE_REFRESH_TOKEN 또는 GDRIVE_FOLDER_ID 미설정)")
 
-    # ── 이메일 발송 ────────────────────────────────────────────
-    print("\n이메일 발송 중...")
-    send_email(
-        subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 {len(new_posts)}건",
-        body=format_email(new_posts, critique, now),
-    )
+    # ── 이메일 발송 (백필 회차는 발송하지 않음) ──────────────────────
+    if BACKFILL:
+        print(f"\n(백필 모드) 이메일 발송 생략 — 이번 회차 {len(new_posts)}건은 Drive에만 저장됨")
+    elif not email_posts:
+        send_email(
+            subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 없음 ✓",
+            body=(
+                f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n"
+                f"직전 이메일 이후 새로 생성된 글은 없습니다.\n"
+                f"(이번 회차에서 백필 등으로 처리된 과거 글 {len(new_posts)}건은 Drive에 저장됨)"
+            ),
+        )
+        print("직전 메일 이후 신규글 없음 → 확인 이메일 발송 완료")
+    else:
+        print("\n이메일 발송 중...")
+        send_email(
+            subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 {len(email_posts)}건",
+            body=format_email(email_posts, critique, now),
+        )
+        save_last_email_at(now)
+        print(f"  발송 완료 (직전 메일 이후 신규 {len(email_posts)}건 / 이번 회차 전체 크롤 {len(new_posts)}건)")
 
     print(f"\n{'=' * 60}")
     print(f"완료 — 처리 {len(new_posts)}건")
