@@ -239,15 +239,12 @@ def format_email(posts: list[dict], critique: str, now: datetime) -> str:
             f"   요약: {(p.get('summary') or '(요약 없음)')[:300]}",
             "",
         ]
-    lines += [
-        "=" * 60,
-        "■ Claude 비판 검토",
-        "",
-        critique,
-        "",
-        "=" * 60,
-        "(자동 발송 — GitHub Actions)",
-    ]
+    lines += ["=" * 60]
+    # critique가 실패/생략 마커("(...)" 형태)면 이메일에 원본 오류를 노출하지 않고
+    # 섹션 자체를 생략한다 (예: Anthropic 크레딧 부족, 키 미설정 등).
+    if critique and not critique.strip().startswith("("):
+        lines += ["■ Claude 비판 검토", "", critique, "", "=" * 60]
+    lines += ["(자동 발송 — GitHub Actions)"]
     return "\n".join(lines)
 
 
@@ -388,7 +385,10 @@ def main():
     if not BACKFILL:
         print("\nClaude 비판 검토 중...")
         critique = claude_critique(email_posts or new_posts)
-        print("  완료")
+        if critique.strip().startswith("("):
+            print(f"  건너뜀: {critique}")
+        else:
+            print("  완료")
 
     # ── Google Drive 저장 (백필 포함 전체를 저장 — 아카이브는 항상 완전하게) ──
     drive = get_drive_service()
@@ -404,8 +404,8 @@ def main():
             except Exception as e:
                 print(f"  Drive 저장 오류: {e}")
 
-        # 비판검토 결과 저장 (백필 회차는 critique를 만들지 않으므로 생략)
-        if critique:
+        # 비판검토 결과 저장 (백필 회차이거나 실패/생략 마커면 저장 안 함)
+        if critique and not critique.strip().startswith("("):
             try:
                 crit_fid = get_or_create_folder(drive, GDRIVE_ROOT, "비판검토")
                 crit_fname = f"{now.strftime('%Y%m%d_%H%M')}_critique.md"
