@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 네이버 아카이버 Cloud Routine — GitHub Actions / 로컬 예약 작업 공용 진입점.
-실행 흐름: 크롤링 → Gemini 요약 → Claude 비판 검토 → Drive 저장 → 이메일 발송
+실행 흐름: 크롤링 → Gemini 요약 → Gemini 비판 검토 → Drive 저장 → 이메일 발송
 """
 import sys, os, json, re
 sys.stdout.reconfigure(encoding="utf-8")
@@ -158,19 +158,12 @@ def save_last_email_at(dt: datetime):
 
 
 # ────────────────────────────────────────────────────────────
-# Claude 비판 검토 (Anthropic API 직접 호출)
+# 비판 검토 (Gemini — Anthropic 크레딧에 의존하지 않도록 전환)
 # ────────────────────────────────────────────────────────────
 
-def claude_critique(posts: list[dict]) -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return "(ANTHROPIC_API_KEY 미설정 — 비판 검토 생략)"
-
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-    except ImportError:
-        return "(anthropic 패키지 없음)"
+def gemini_critique(posts: list[dict], keys: list[str]) -> str:
+    if not keys:
+        return "(GEMINI_API_KEY 미설정 — 비판 검토 생략)"
 
     items = []
     for p in posts:
@@ -192,15 +185,8 @@ def claude_critique(posts: list[dict]) -> str:
 마지막에 오늘 핵심 논점 2~3줄 요약.
 """
 
-    try:
-        resp = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text
-    except Exception as e:
-        return f"(Claude API 오류: {e})"
+    result = _call(prompt, keys, max_tokens=1500)
+    return result or "(Gemini 비판 검토 실패 — 쿼터 초과 또는 응답 없음)"
 
 
 # ────────────────────────────────────────────────────────────
@@ -243,7 +229,7 @@ def format_email(posts: list[dict], critique: str, now: datetime) -> str:
     # critique가 실패/생략 마커("(...)" 형태)면 이메일에 원본 오류를 노출하지 않고
     # 섹션 자체를 생략한다 (예: Anthropic 크레딧 부족, 키 미설정 등).
     if critique and not critique.strip().startswith("("):
-        lines += ["■ Claude 비판 검토", "", critique, "", "=" * 60]
+        lines += ["■ 비판 검토 (Gemini)", "", critique, "", "=" * 60]
     lines += ["(자동 발송 — GitHub Actions)"]
     return "\n".join(lines)
 
@@ -380,11 +366,11 @@ def main():
     last_email_at = load_last_email_at()
     email_posts = [p for p in new_posts if p.get("published_dt") and p["published_dt"] > last_email_at]
 
-    # ── Claude 비판 검토 (백필 회차는 생략 — 이메일에 안 쓰이므로 불필요한 호출) ──
+    # ── 비판 검토 (Gemini, 백필 회차는 생략 — 이메일에 안 쓰이므로 불필요한 호출) ──
     critique = ""
     if not BACKFILL:
-        print("\nClaude 비판 검토 중...")
-        critique = claude_critique(email_posts or new_posts)
+        print("\n비판 검토 중 (Gemini)...")
+        critique = gemini_critique(email_posts or new_posts, gemini_keys)
         if critique.strip().startswith("("):
             print(f"  건너뜀: {critique}")
         else:
