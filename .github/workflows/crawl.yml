@@ -1,8 +1,9 @@
 name: Naver Archiver — 자동 크롤링·분석·발송
 
 # KST 01:00 / 07:00 / 12:00 / 17:00 실행 (= UTC 16:00 / 22:00 / 03:00 / 08:00)
-# 01:00 회차는 과거글 백필 전용 — 그날 남은 Gemini 쿼터를 소진할 때까지 캡 없이
-# 크롤링하고, 이메일은 보내지 않는다(Drive에만 조용히 쌓임).
+# 01:00 회차는 과거글 백필 전용. 크롤 페이지 수·처리 건수는 routine.py에서
+# 유한한 캡으로 제한되어 있음 (2026-07 GitHub Actions 무료 사용량을 이 회차가
+# 무제한 크롤로 소진시켜 이후 모든 스케줄 실행이 즉시 실패했던 사고 재발 방지).
 on:
   schedule:
     - cron: '0 16 * * *'   # 01:00 KST (백필 전용, 이메일 없음)
@@ -14,10 +15,14 @@ on:
 permissions:
   contents: write            # seen.json 커밋을 위한 쓰기 권한
 
+concurrency:
+  group: naver-archiver-crawl
+  cancel-in-progress: true   # 겹치는 실행이 Actions 분(分)을 이중으로 태우지 않도록
+
 jobs:
   crawl-analyze-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 180     # 01:00 백필 회차는 쿼터 소진까지 오래 걸릴 수 있음
+    timeout-minutes: 30      # routine.py 쪽 캡으로 정상 종료되는 것이 기본, 이건 안전망
 
     steps:
       - name: Checkout repo

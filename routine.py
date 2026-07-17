@@ -35,6 +35,10 @@ _BATCH_CHAR_MAX  = 4000  # 배치 내 총 글자 수 상한 (토큰 절약)
 _MAX_PER_SOURCE  = 25    # 소스당 최대 처리 글 수 (캐치업 모드)
 _MAX_TOTAL       = 75    # 런당 전체 처리 글 수 상한 (캐치업 모드)
 
+_BACKFILL_MAX_PER_SOURCE = 150   # 백필 회차 소스당 상한 (평소의 6배 — 무제한 아님)
+_BACKFILL_MAX_TOTAL      = 300   # 백필 회차 전체 상한
+_BACKFILL_MAX_PAGES      = 25    # 백필 회차 블로그 페이지 상한 (평소 5의 5배)
+
 
 def _summarize_batch(batch: list[dict], keys: list[str]) -> list[str | None]:
     """2~4개 글을 1회 Gemini 호출로 처리. 요청 횟수를 1/N로 절감."""
@@ -117,6 +121,46 @@ GDRIVE_ROOT    = os.environ.get("GDRIVE_FOLDER_ID", "")
 # 새벽 백필 전용 회차(ARCHIVER_BACKFILL=1) — 그날 남은 Gemini 쿼터를 소진할 때까지
 # 과거 글을 최대한 크롤링하되, 이메일은 보내지 않는다(조용히 Drive에만 쌓인다).
 BACKFILL = os.environ.get("ARCHIVER_BACKFILL", "0") == "1"
+
+
+# ────────────────────────────────────────────────────────────
+# 네이버 로그인 쿠키 만료 감지 — 만료된 뒤에야 크롤이 조용히 저하되는 대신
+# 만료 D-5일부터 이메일에 경고 배너를 띄워 미리 재로그인하게 한다.
+# ────────────────────────────────────────────────────────────
+
+_COOKIE_WARN_DAYS = 5
+
+def check_cookie_expiry(cookies_json: str) -> str | None:
+    if not cookies_json:
+        return None
+    try:
+        cookies = json.loads(cookies_json)
+    except Exception:
+        return None
+
+    auth_names = {"NID_AUT", "NID_SES", "nid_inf"}
+    expiries = [
+        c["expiry"] for c in cookies
+        if isinstance(c, dict) and c.get("name") in auth_names and c.get("expiry")
+    ]
+    if not expiries:
+        return None
+
+    soonest = datetime.fromtimestamp(min(expiries), KST)
+    days_left = (soonest - datetime.now(KST)).total_seconds() / 86400
+
+    if days_left < 0:
+        return (
+            f"⚠ 네이버 로그인 쿠키가 {abs(days_left):.0f}일 전 만료됨 "
+            f"({soonest.strftime('%Y-%m-%d')}) — 카페 크롤이 조용히 누락되고 있을 수 있음. "
+            f"setup_login.py 재실행 필요."
+        )
+    if days_left <= _COOKIE_WARN_DAYS:
+        return (
+            f"⚠ 네이버 로그인 쿠키 {days_left:.1f}일 후 만료 "
+            f"({soonest.strftime('%Y-%m-%d')}) — 만료 전 setup_login.py 재실행 필요."
+        )
+    return None
 
 
 # ────────────────────────────────────────────────────────────
@@ -211,13 +255,15 @@ date: {post['date']}
 """
 
 
-def format_email(posts: list[dict], critique: str, now: datetime) -> str:
+def format_email(posts: list[dict], critique: str, now: datetime, warning: str | None = None) -> str:
     lines = [
         f"네이버 아카이버 자동 수집 — {now.strftime('%Y-%m-%d %H:%M KST')}",
         f"새 글 {len(posts)}건",
         "=" * 60,
         "",
     ]
+    if warning:
+        lines = [warning, "=" * 60, ""] + lines
     for p in posts:
         lines += [
             f"▶ [{p['author']}] {p['title']}",
@@ -243,15 +289,16 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"네이버 아카이버 실행: {now.strftime('%Y-%m-%d %H:%M KST')}")
     if BACKFILL:
-        print("모드: 새벽 백필 전용 (캡 해제, 이메일 미발송)")
+        print("모드: 새벽 백필 전용 (캡 확장, 이메일 미발송)")
     print(f"{'=' * 60}\n")
 
-    # 백필 회차는 캡을 사실상 해제하고, RSS 50개 캡 밖의 과거 글을 적극적으로 찾는다.
-    # 평상시 회차는 RSS 최근 50개 안에서만 신규글을 판단(= 오탐 없는 "진짜 새 글"만).
-    max_per_source = 10**9 if BACKFILL else _MAX_PER_SOURCE
-    max_total       = 10**9 if BACKFILL else _MAX_TOTAL
-    blog_want       = 10**9 if BACKFILL else 0
-    blog_max_pages  = 400   if BACKFILL else 5
+    # 백필 회차는 평상시보다 훨씬 깊게 과거 글을 찾지만, 무제한은 아니다.
+    # (2026-07: 무제한 크롤이 하루 최대 180분씩 GitHub Actions 무료 사용량을
+    #  소진시켜 이후 모든 스케줄 실행이 실패한 사고가 있었음 — 유한 캡으로 고정)
+    max_per_source = _BACKFILL_MAX_PER_SOURCE if BACKFILL else _MAX_PER_SOURCE
+    max_total       = _BACKFILL_MAX_TOTAL      if BACKFILL else _MAX_TOTAL
+    blog_want       = _BACKFILL_MAX_TOTAL      if BACKFILL else 0
+    blog_max_pages  = _BACKFILL_MAX_PAGES      if BACKFILL else 5
 
     gemini_keys = _keys()
     cookies_json = os.environ.get("NAVER_COOKIES_JSON", "")
@@ -260,6 +307,9 @@ def main():
         local_cookie_file = Path(__file__).parent / "naver_cookies.json"
         if local_cookie_file.exists():
             cookies_json = local_cookie_file.read_text(encoding="utf-8")
+    cookie_warning = check_cookie_expiry(cookies_json)
+    if cookie_warning:
+        print(cookie_warning)
     sess = make_session(cookies_json or None)
     seen = load_seen()
     print(f"seen URLs: {len(seen)}개\n")
@@ -329,7 +379,7 @@ def main():
 
     close_selenium_driver()
 
-    # 전체 상한 적용 (백필 회차는 사실상 무제한 — Gemini 쿼터 소진이 자연스러운 한도가 된다)
+    # 전체 상한 적용 (백필 회차도 _BACKFILL_MAX_TOTAL로 유한하게 제한)
     if len(new_posts) > max_total:
         print(f"  ⚠ 총 {len(new_posts)}개 중 {max_total}개만 처리 (상한 적용)")
         new_posts = new_posts[:max_total]
@@ -343,9 +393,12 @@ def main():
         if BACKFILL:
             print("백필 대상 없음 (모든 소스가 이미 최신 상태) → 이메일 없이 종료")
             return
+        body = f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n새로 올라온 글이 없습니다."
+        if cookie_warning:
+            body = f"{cookie_warning}\n{'=' * 60}\n{body}"
         send_email(
             subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 없음 ✓",
-            body=f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n새로 올라온 글이 없습니다.",
+            body=body,
         )
         print("새 글 없음 → 확인 이메일 발송 완료")
         return
@@ -407,20 +460,23 @@ def main():
     if BACKFILL:
         print(f"\n(백필 모드) 이메일 발송 생략 — 이번 회차 {len(new_posts)}건은 Drive에만 저장됨")
     elif not email_posts:
+        body = (
+            f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n"
+            f"직전 이메일 이후 새로 생성된 글은 없습니다.\n"
+            f"(이번 회차에서 백필 등으로 처리된 과거 글 {len(new_posts)}건은 Drive에 저장됨)"
+        )
+        if cookie_warning:
+            body = f"{cookie_warning}\n{'=' * 60}\n{body}"
         send_email(
             subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 없음 ✓",
-            body=(
-                f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}\n"
-                f"직전 이메일 이후 새로 생성된 글은 없습니다.\n"
-                f"(이번 회차에서 백필 등으로 처리된 과거 글 {len(new_posts)}건은 Drive에 저장됨)"
-            ),
+            body=body,
         )
         print("직전 메일 이후 신규글 없음 → 확인 이메일 발송 완료")
     else:
         print("\n이메일 발송 중...")
         send_email(
             subject=f"[네이버 아카이버] {now.strftime('%m/%d %H:%M')} — 새 글 {len(email_posts)}건",
-            body=format_email(email_posts, critique, now),
+            body=format_email(email_posts, critique, now, warning=cookie_warning),
         )
         save_last_email_at(now)
         print(f"  발송 완료 (직전 메일 이후 신규 {len(email_posts)}건 / 이번 회차 전체 크롤 {len(new_posts)}건)")
